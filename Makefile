@@ -102,7 +102,7 @@ docker-up: ## Run the three deployment images locally (reuses your Postgres and 
 docker-down: ## Stop the deployment images
 	docker compose -f deploy/docker-compose.yml down
 
-aws-secrets: ## Push the runtime half of backend/.env to AWS Secrets Manager
+aws-secrets: ## Push the runtime half of backend/.env to the SSM parameter /nandex/app-env
 	scripts/push_aws_secrets.sh
 
 gh-secrets: ## Push the CI credentials in backend/.env to GitHub Actions secrets

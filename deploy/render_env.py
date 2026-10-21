@@ -1,4 +1,4 @@
-"""Turns the Secrets Manager JSON blob into a .env file.
+"""Turns the SSM parameter's JSON blob into a .env file.
 
 A separate file rather than a heredoc inside user_data.sh: quoting a Python program
 inside a bash script inside a Terraform string is three levels of escaping, and it is

@@ -1,11 +1,10 @@
 #!/usr/bin/env bash
-# Pushes the runtime half of backend/.env into one AWS Secrets Manager secret.
+# Pushes the runtime half of backend/.env into one SSM SecureString parameter.
 #
 #   make aws-secrets
 #
-# One secret holding a JSON map, not one secret per value: Secrets Manager bills per
-# secret per month, and the deployed box wants the whole environment in a single call
-# at boot rather than twenty.
+# One parameter holding a JSON map, not one per value: the deployed box wants the whole
+# environment in a single call at boot. Standard tier is free and holds 4 KB.
 #
 # Values are never printed. Only key names are echoed.
 
@@ -15,15 +14,15 @@ cd "$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
 PROFILE=${AWS_PROFILE_NAME:-personal}
 REGION=${AWS_REGION_NAME:-ap-southeast-2}
-SECRET_NAME=${SECRET_NAME:-nandex/app-env}
+PARAMETER_NAME=${PARAMETER_NAME:-/nandex/app-env}
 
 [ -f backend/.env ] || { echo "error: backend/.env is missing." >&2; exit 1; }
 
-python3 - "$SECRET_NAME" "$PROFILE" "$REGION" <<'PY'
+python3 - "$PARAMETER_NAME" "$PROFILE" "$REGION" <<'PY'
 import json, re, subprocess, sys
 from pathlib import Path
 
-secret_name, profile, region = sys.argv[1:4]
+parameter_name, profile, region = sys.argv[1:4]
 
 # Excluded on purpose. These authenticate CI to GitHub, Terraform, Render and Netlify;
 # nothing running in a container needs them, and a runtime secret that carries them
@@ -45,7 +44,9 @@ for line in Path("backend/.env").read_text().splitlines():
         continue
     env[k] = v
 
-payload = json.dumps(env, indent=2, sort_keys=True)
+payload = json.dumps(env, sort_keys=True, separators=(",", ":"))
+if len(payload.encode()) > 4096:
+    sys.exit(f"{len(payload.encode())} bytes is over the 4 KB standard-tier limit")
 
 def aws(*args, stdin=None):
     return subprocess.run(
@@ -53,21 +54,13 @@ def aws(*args, stdin=None):
         input=stdin, capture_output=True, text=True,
     )
 
-exists = aws("secretsmanager", "describe-secret", "--secret-id", secret_name).returncode == 0
-if exists:
-    r = aws("secretsmanager", "put-secret-value", "--secret-id", secret_name,
-            "--secret-string", payload)
-    action = "updated"
-else:
-    r = aws("secretsmanager", "create-secret", "--name", secret_name,
-            "--description", "Runtime environment for the nandex containers",
-            "--secret-string", payload)
-    action = "created"
+r = aws("ssm", "put-parameter", "--name", parameter_name, "--type", "SecureString",
+        "--tier", "Standard", "--overwrite", "--value", payload)
 
 if r.returncode != 0:
     sys.exit(f"failed: {r.stderr.strip()[:300]}")
 
-print(f"{action} {secret_name} with {len(env)} keys:")
+print(f"wrote {parameter_name} with {len(env)} keys ({len(payload.encode())} bytes):")
 for k in sorted(env):
     print("   ", k)
 PY
