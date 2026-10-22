@@ -5,6 +5,7 @@
 # Next.js build beside the running stack does not fit in 4 GB. First boot has no tag yet,
 # so infra/user_data.sh builds from source once. Every limit below is a ceiling, so one
 # leaking service is killed and restarted instead of taking the box down with it.
+# Sized at about 1.5x each container's peak over 25 days on the 8 GB box.
 
 name: nandex
 
@@ -66,7 +67,7 @@ services:
   postgres:
     image: pgvector/pgvector:pg17
     restart: unless-stopped
-    mem_limit: 768m
+    mem_limit: 512m
     environment:
       POSTGRES_DB: ${DB_NAME:-ragdb}
       POSTGRES_USER: ${DB_USER:-ragdb}
@@ -85,7 +86,7 @@ services:
       context: ..
       dockerfile: deploy/Dockerfile.core
     restart: unless-stopped
-    mem_limit: 768m
+    mem_limit: 1536m
     env_file: /opt/nandex/.env
     environment:
       PORT: "8000"
@@ -107,7 +108,7 @@ services:
       context: ..
       dockerfile: deploy/Dockerfile.worker
     restart: unless-stopped
-    mem_limit: 512m
+    mem_limit: 384m
     env_file: /opt/nandex/.env
     environment:
       DB_HOST: postgres
@@ -123,7 +124,7 @@ services:
       context: ..
       dockerfile: deploy/Dockerfile.agent
     restart: unless-stopped
-    mem_limit: 1g
+    mem_limit: 1280m
     env_file: /opt/nandex/.env
     environment:
       # Reaches core inside the compose network rather than back out through Caddy.
