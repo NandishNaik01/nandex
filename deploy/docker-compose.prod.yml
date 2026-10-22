@@ -1,8 +1,11 @@
 # The deployed stack. One EC2 instance in ap-southeast-2 runs all of this, the two
 # Next.js sites and nantex's static page included; Temporal and LiveKit are managed.
 #
-# Brought up by infra/user_data.sh on first boot and by SSM Run Command thereafter:
-#   docker compose -f deploy/docker-compose.prod.yml --env-file /opt/nandex/.env up -d --build
+# Deploys pull images CI built (ghcr.io, tagged with the commit) and never build here: a
+# Next.js build beside the running stack does not fit in 4 GB. First boot has no tag yet,
+# so infra/user_data.sh builds from source once. Every limit below is a ceiling, so one
+# leaking service is killed and restarted instead of taking the box down with it.
+# Sized at about 1.5x each container's peak over 25 days on the 8 GB box.
 
 name: nandex
 
@@ -10,6 +13,7 @@ services:
   caddy:
     image: caddy:2-alpine
     restart: unless-stopped
+    mem_limit: 128m
     ports:
       - "80:80"
       - "443:443"
@@ -36,17 +40,19 @@ services:
 
   # AutoInterviewer. /api/* is rewritten to core inside the compose network.
   frontend:
+    image: ghcr.io/nandishnaik01/nandex-frontend:${IMAGE_TAG:-local}
     build:
       context: ..
       dockerfile: deploy/Dockerfile.web
       args:
         APP: frontend
     restart: unless-stopped
-    mem_limit: 512m
+    mem_limit: 256m
     depends_on:
       - core
 
   portfolio:
+    image: ghcr.io/nandishnaik01/nandex-portfolio:${IMAGE_TAG:-local}
     build:
       context: ..
       dockerfile: deploy/Dockerfile.web
@@ -54,13 +60,14 @@ services:
         APP: portfolio
         NEXT_PUBLIC_BOOKING_URL: ${NEXT_PUBLIC_BOOKING_URL:-}
     restart: unless-stopped
-    mem_limit: 512m
+    mem_limit: 256m
     depends_on:
       - core
 
   postgres:
     image: pgvector/pgvector:pg17
     restart: unless-stopped
+    mem_limit: 512m
     environment:
       POSTGRES_DB: ${DB_NAME:-ragdb}
       POSTGRES_USER: ${DB_USER:-ragdb}
@@ -74,10 +81,12 @@ services:
       retries: 20
 
   core:
+    image: ghcr.io/nandishnaik01/nandex-core:${IMAGE_TAG:-local}
     build:
       context: ..
       dockerfile: deploy/Dockerfile.core
     restart: unless-stopped
+    mem_limit: 1536m
     env_file: /opt/nandex/.env
     environment:
       PORT: "8000"
@@ -94,10 +103,12 @@ services:
         condition: service_healthy
 
   worker:
+    image: ghcr.io/nandishnaik01/nandex-worker:${IMAGE_TAG:-local}
     build:
       context: ..
       dockerfile: deploy/Dockerfile.worker
     restart: unless-stopped
+    mem_limit: 384m
     env_file: /opt/nandex/.env
     environment:
       DB_HOST: postgres
@@ -108,10 +119,12 @@ services:
         condition: service_healthy
 
   agent:
+    image: ghcr.io/nandishnaik01/nandex-agent:${IMAGE_TAG:-local}
     build:
       context: ..
       dockerfile: deploy/Dockerfile.agent
     restart: unless-stopped
+    mem_limit: 1280m
     env_file: /opt/nandex/.env
     environment:
       # Reaches core inside the compose network rather than back out through Caddy.
@@ -123,13 +136,17 @@ services:
   # submission, which is why it exists and why it is never published: anything that
   # reaches it with its bearer token can start containers on this host.
   runner:
+    image: ghcr.io/nandishnaik01/nandex-runner:${IMAGE_TAG:-local}
     build:
       context: ..
       dockerfile: deploy/Dockerfile.runner
     restart: unless-stopped
+    mem_limit: 192m
     env_file: /opt/nandex/.env
     environment:
       PORT: "8002"
+      # Two at once on a 4 GB box; a third is refused with 429 rather than queued.
+      RUNNER_MAX_CONCURRENT_RUNS: "2"
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
 

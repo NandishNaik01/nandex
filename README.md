@@ -388,8 +388,10 @@ make portfolio        # http://localhost:3001, proxies /api/* to BACKEND_ORIGIN
 | Email | Resend, sending from `contact.nandish.online` | — |
 
 - **Merging to `main` deploys.** `.github/workflows/deploy.yml` runs once CI passes and, when the
-  merge touched the stack or either site, rebuilds it over SSM at the exact commit CI passed
-  (`deploy/Dockerfile.web` builds both Next.js apps). Run it manually to deploy everything.
+  merge touched the stack or either site, builds every image on an arm64 runner, pushes it to
+  `ghcr.io/nandishnaik01/nandex-*` tagged with the commit, and has the box pull and restart over
+  SSM. The box never builds: a `t4g.medium` (4 GB) has no room for a Next.js build beside the
+  stack. Run it manually to deploy everything.
 - **nantex's page** is copied from `NandishNaik01/nantex` main by `nantex-site.yml` every 30
   minutes, or on a manual run.
 - **Site hostnames** are `PORTFOLIO_SITE`, `FRONTEND_SITE` and `NANTEX_SITE` in `/opt/nandex/.env`
@@ -400,7 +402,7 @@ make portfolio        # http://localhost:3001, proxies /api/* to BACKEND_ORIGIN
 - **Infrastructure** is Terraform in `infra/` (EC2, IAM and GitHub OIDC, and the Netlify sites
   kept as a rollback until they are deleted), planned on every PR and applied on merge by
   `infra.yml`.
-- **Runtime configuration** lives in one AWS Secrets Manager secret, `nandex/app-env`, pushed
+- **Runtime configuration** lives in one SSM SecureString parameter, `/nandex/app-env`, pushed
   from `backend/.env` with `make aws-secrets` and rendered to `/opt/nandex/.env` on first boot.
 - **DNS** for `nandish.online` is at Hostinger (not in Terraform): the site names point at the
   instance's Elastic IP, and Resend's DKIM, SPF and DMARC records live under `contact`.

@@ -31,15 +31,15 @@ variable "aws_region" {
 }
 
 variable "instance_type" {
-  description = "2 vCPU / 8 GB. A 4 GB box cannot hold the runner's own concurrency limit."
+  description = "2 vCPU / 4 GB. Fits because images are built in CI, the runner is capped at two runs, and user_data adds 2 GB of swap."
   type        = string
-  default     = "t4g.large"
+  default     = "t4g.medium"
 }
 
-variable "secret_name" {
-  description = "Secrets Manager secret holding the runtime environment, written by make aws-secrets."
+variable "app_env_parameter" {
+  description = "SSM SecureString holding the runtime environment as JSON, written by make aws-secrets."
   type        = string
-  default     = "nandex/app-env"
+  default     = "/nandex/app-env"
 }
 
 variable "netlify_portfolio_site_id" {

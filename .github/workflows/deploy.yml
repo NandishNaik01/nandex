@@ -1,5 +1,6 @@
-# Ships main once CI has passed on it: the EC2 stack over SSM, the two Next.js sites
-# included. Nothing runs when the merge touched none of it; a manual run deploys all.
+# Ships main once CI has passed on it: every image is built here and pushed to ghcr.io,
+# tagged with the commit, and the EC2 box pulls and restarts over SSM. Nothing runs when
+# the merge touched none of it; a manual run deploys all.
 name: Deploy
 
 on:
@@ -12,6 +13,8 @@ on:
 permissions:
   contents: read
   id-token: write
+  packages: write
+  actions: read
 
 # Never two deploys racing on the one box; a newer merge waits for the running one.
 concurrency:
@@ -21,6 +24,7 @@ concurrency:
 env:
   AWS_REGION: ${{ vars.AWS_REGION }}
   SHA: ${{ github.event.workflow_run.head_sha || github.sha }}
+  REGISTRY: ghcr.io/nandishnaik01
 
 jobs:
   changes:
@@ -31,9 +35,7 @@ jobs:
       (github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.event == 'push')
     runs-on: ubuntu-latest
     outputs:
-      backend: ${{ steps.diff.outputs.backend }}
-      frontend: ${{ steps.diff.outputs.frontend }}
-      portfolio: ${{ steps.diff.outputs.portfolio }}
+      deploy: ${{ steps.diff.outputs.deploy }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -42,28 +44,70 @@ jobs:
       - id: diff
         run: |
           if [ "${{ github.event_name }}" = workflow_dispatch ]; then
-            printf 'backend=true\nfrontend=true\nportfolio=true\n' >> "$GITHUB_OUTPUT"
+            echo "deploy=true" >> "$GITHUB_OUTPUT"
             exit 0
           fi
           # main only takes squash merges, so the merge is exactly one commit.
           changed=$(git diff --name-only HEAD~1 HEAD)
           echo "$changed"
-          touched() { echo "$changed" | grep -qE "$1" && echo true || echo false; }
-          shared='^(packages/ui/|pnpm-lock\.yaml|pnpm-workspace\.yaml|package\.json)'
-          {
-            echo "backend=$(touched '^(backend/|agent/|deploy/|integrations\.yaml|dev/runner/|portfolio/content/sources/)')"
-            echo "frontend=$(touched "^frontend/|$shared")"
-            echo "portfolio=$(touched "^portfolio/|$shared")"
-          } >> "$GITHUB_OUTPUT"
+          pattern='^(backend/|agent/|deploy/|integrations\.yaml|dev/runner/|frontend/|portfolio/|packages/ui/|pnpm-lock\.yaml|pnpm-workspace\.yaml|package\.json)'
+          echo "deploy=$(echo "$changed" | grep -qE "$pattern" && echo true || echo false)" >> "$GITHUB_OUTPUT"
+
+  images:
+    needs: changes
+    if: needs.changes.outputs.deploy == 'true'
+    # The box is Graviton, so the images are arm64 and built natively.
+    runs-on: ubuntu-24.04-arm
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          - { service: core, dockerfile: deploy/Dockerfile.core }
+          - { service: worker, dockerfile: deploy/Dockerfile.worker }
+          - { service: agent, dockerfile: deploy/Dockerfile.agent }
+          - { service: runner, dockerfile: deploy/Dockerfile.runner }
+          - { service: frontend, dockerfile: deploy/Dockerfile.web, app: frontend }
+          - { service: portfolio, dockerfile: deploy/Dockerfile.web, app: portfolio }
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.SHA }}
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ${{ matrix.dockerfile }}
+          build-args: ${{ matrix.app && format('APP={0}', matrix.app) || '' }}
+          push: true
+          tags: ${{ env.REGISTRY }}/nandex-${{ matrix.service }}:${{ env.SHA }}
+          cache-from: type=gha,scope=${{ matrix.service }}
+          cache-to: type=gha,scope=${{ matrix.service }},mode=max
 
   server:
-    needs: changes
-    if: >-
-      needs.changes.outputs.backend == 'true' || needs.changes.outputs.frontend == 'true' ||
-      needs.changes.outputs.portfolio == 'true'
+    needs: [changes, images]
     runs-on: ubuntu-latest
-    timeout-minutes: 40
+    timeout-minutes: 30
     steps:
+      # infra.yml applies on the same push; a resize stops the box, so the deploy waits
+      # for it rather than racing it.
+      - name: Wait for Infra on this commit
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          for _ in $(seq 1 60); do
+            pending=$(gh run list -R "$GITHUB_REPOSITORY" --workflow infra.yml --commit "$SHA" \
+              --json status -q '[.[] | select(.status != "completed")] | length')
+            [ "$pending" = 0 ] && exit 0
+            echo "waiting on $pending infra run(s)"
+            sleep 20
+          done
+          echo "infra never finished" >&2
+          exit 1
       - uses: aws-actions/configure-aws-credentials@v4
         with:
           role-to-assume: ${{ vars.AWS_ROLE_ARN }}
@@ -74,40 +118,58 @@ jobs:
             --filters Name=tag:Name,Values=nandex-app Name=instance-state-name,Values=running \
             --query 'Reservations[0].Instances[0].[InstanceId,PublicIpAddress]' --output text)
           [ "$id" != None ] || { echo "no running nandex-app instance" >&2; exit 1; }
+          # Just after a resize the agent takes a minute to check back in.
+          for _ in $(seq 1 30); do
+            ping=$(aws ssm describe-instance-information --filters "Key=InstanceIds,Values=$id" \
+              --query 'InstanceInformationList[0].PingStatus' --output text)
+            [ "$ping" = Online ] && break
+            sleep 10
+          done
           echo "id=$id" >> "$GITHUB_OUTPUT"
           echo "ip=$ip" >> "$GITHUB_OUTPUT"
-      - name: Pull and rebuild over SSM
+      - name: Pull and restart over SSM
+        env:
+          # Valid only until this job ends, so the box never holds a lasting registry
+          # credential; it logs out again before the command finishes.
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           # The exact commit CI passed, not whatever main is by the time this runs.
-          params=$(jq -nc --arg sha "$SHA" '{commands: [
+          params=$(jq -nc --arg sha "$SHA" --arg token "$GHCR_TOKEN" --arg actor "$GITHUB_ACTOR" '{commands: [
             "set -euo pipefail",
+            # Boxes created before user_data made swap get it here, once.
+            "if [ ! -f /swapfile ]; then fallocate -l 2G /swapfile && chmod 600 /swapfile && mkswap /swapfile && swapon /swapfile && echo \"/swapfile none swap defaults 0 0\" >> /etc/fstab; fi",
             "cd /opt/nandex/app",
             "git fetch --depth 1 origin \($sha)",
             "git reset --hard FETCH_HEAD",
-            # One image at a time: two Next.js builds beside the Python images, in
-            # parallel, would crowd the runner and the database out of memory.
-            "export COMPOSE_PARALLEL_LIMIT=1",
-            "docker compose -f deploy/docker-compose.prod.yml --env-file /opt/nandex/.env up -d --build --remove-orphans",
+            # Kept in .env so a manual compose command uses the deployed images too.
+            "if grep -q ^IMAGE_TAG= /opt/nandex/.env; then sed -i \"s|^IMAGE_TAG=.*|IMAGE_TAG=\($sha)|\" /opt/nandex/.env; else echo IMAGE_TAG=\($sha) >> /opt/nandex/.env; fi",
+            "echo \($token) | docker login ghcr.io -u \($actor) --password-stdin",
+            # Ours only: pulling postgres and caddy would recreate them on every upstream push.
+            "docker compose -f deploy/docker-compose.prod.yml --env-file /opt/nandex/.env pull --quiet core worker agent runner frontend portfolio || { docker logout ghcr.io; exit 1; }",
+            "docker logout ghcr.io",
+            "docker compose -f deploy/docker-compose.prod.yml --env-file /opt/nandex/.env up -d --no-build --remove-orphans",
             # A changed Caddyfile is a bind mount, so up leaves the running Caddy on the old one.
             "docker compose -f deploy/docker-compose.prod.yml --env-file /opt/nandex/.env exec -T caddy caddy reload --config /etc/caddy/Caddyfile",
             "for s in frontend portfolio; do for i in $(seq 1 30); do docker compose -f deploy/docker-compose.prod.yml --env-file /opt/nandex/.env exec -T $s wget -qO /dev/null http://127.0.0.1:3000/ && break; [ $i = 30 ] && { echo \"$s never answered\"; exit 1; }; sleep 2; done; done",
-            "docker image prune -f"
+            # Every deploy is a new tag, so unused images would fill the disk.
+            "docker image prune -af",
+            "docker builder prune -af"
           ]}')
           cmd=$(aws ssm send-command \
             --instance-ids "${{ steps.instance.outputs.id }}" \
             --document-name AWS-RunShellScript \
             --comment "deploy ${SHA:0:7}" \
-            --timeout-seconds 2400 \
+            --timeout-seconds 1200 \
             --parameters "$params" \
             --query Command.CommandId --output text)
           echo "command $cmd"
-          # The aws waiter gives up after ~8 minutes; an image rebuild can take longer.
-          for _ in $(seq 1 120); do
+          for _ in $(seq 1 60); do
             status=$(aws ssm get-command-invocation --command-id "$cmd" \
               --instance-id "${{ steps.instance.outputs.id }}" --query Status --output text 2>/dev/null || echo Pending)
             case "$status" in Success|Failed|Cancelled|TimedOut) break ;; esac
-            sleep 20
+            sleep 15
           done
+          # The token is in the command's parameters, never in its output.
           aws ssm get-command-invocation --command-id "$cmd" --instance-id "${{ steps.instance.outputs.id }}" \
             --query '[StandardOutputContent,StandardErrorContent]' --output text | tail -60
           [ "$status" = Success ] || { echo "deploy finished as $status" >&2; exit 1; }
@@ -120,4 +182,3 @@ jobs:
           done
           echo "$url never answered" >&2
           exit 1
-

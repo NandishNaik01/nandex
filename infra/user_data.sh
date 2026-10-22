@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # First boot only. Installs Docker, clones the repository, writes the runtime
-# environment from Secrets Manager, and starts the stack.
+# environment from SSM Parameter Store, and starts the stack.
 #
 # Deliberately not the deploy mechanism: updates go through SSM Run Command, which runs
 # `git pull && docker compose up -d --build` against this same checkout.
@@ -28,7 +28,15 @@ chmod +x /usr/libexec/docker/cli-plugins/docker-buildx
 install -d -m 0755 /opt/nandex
 git clone --depth 1 https://github.com/NandishNaik01/nandex.git /opt/nandex/app
 
-# IMDSv2. The instance role grants GetSecretValue on one secret and nothing else.
+# 2 GB of swap: a 4 GB box rides out a burst of code runs instead of losing a
+# container to the OOM killer.
+fallocate -l 2G /swapfile
+chmod 600 /swapfile
+mkswap /swapfile
+swapon /swapfile
+echo '/swapfile none swap defaults 0 0' >> /etc/fstab
+
+# IMDSv2. The instance role reads one SSM parameter and nothing else.
 TOKEN=$(curl -fsSL -X PUT http://169.254.169.254/latest/api/token \
     -H 'X-aws-ec2-metadata-token-ttl-seconds: 60')
 REGION=$(curl -fsSL -H "X-aws-ec2-metadata-token: $TOKEN" \
@@ -36,8 +44,8 @@ REGION=$(curl -fsSL -H "X-aws-ec2-metadata-token: $TOKEN" \
 PUBLIC_IP=$(curl -fsSL -H "X-aws-ec2-metadata-token: $TOKEN" \
     http://169.254.169.254/latest/meta-data/public-ipv4)
 
-aws secretsmanager get-secret-value --secret-id nandex/app-env --region "$REGION" \
-    --query SecretString --output text > /tmp/app-env.json
+aws ssm get-parameter --name /nandex/app-env --with-decryption --region "$REGION" \
+    --query Parameter.Value --output text > /tmp/app-env.json
 
 python3 /opt/nandex/app/deploy/render_env.py /tmp/app-env.json /opt/nandex/.env
 rm -f /tmp/app-env.json

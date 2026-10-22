@@ -61,7 +61,7 @@ resource "aws_eip_association" "app" {
   allocation_id = aws_eip.app.id
 }
 
-# SSM for shell access without a key or an open port; one secret for the runtime
+# SSM for shell access without a key or an open port; one parameter for the runtime
 # environment. Nothing else -- the instance has no reason to reach the rest of AWS.
 resource "aws_iam_role" "app" {
   name = "nandex-app"
@@ -81,22 +81,20 @@ resource "aws_iam_role_policy_attachment" "ssm" {
   policy_arn = "arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore"
 }
 
-resource "aws_iam_role_policy" "read_app_secret" {
-  name = "read-app-secret"
+# A standard-tier SecureString rather than Secrets Manager: free instead of $0.40 a
+# month, encrypted with the account's aws/ssm key, which needs no kms grant here.
+resource "aws_iam_role_policy" "read_app_env" {
+  name = "read-app-env"
   role = aws_iam_role.app.id
 
   policy = jsonencode({
     Version = "2012-10-17"
     Statement = [{
       Effect   = "Allow"
-      Action   = ["secretsmanager:GetSecretValue"]
-      Resource = data.aws_secretsmanager_secret.app_env.arn
+      Action   = ["ssm:GetParameter"]
+      Resource = "arn:aws:ssm:${var.aws_region}:${data.aws_caller_identity.current.account_id}:parameter${var.app_env_parameter}"
     }]
   })
-}
-
-data "aws_secretsmanager_secret" "app_env" {
-  name = var.secret_name
 }
 
 resource "aws_iam_instance_profile" "app" {
